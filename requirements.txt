@@ -1,7 +1,7 @@
 streamlit
-streamlit-autorefresh
-plotly
 pandas
 numpy
-requests
+plotly
 nsepython
+requests
+streamlit-autorefresh
