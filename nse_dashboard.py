@@ -8,14 +8,13 @@ import requests
 from datetime import date, timedelta
 
 # ===========================================
-# PAGE CONFIG + DARK THEME OVERRIDE
+# PAGE CONFIG + DARK THEME
 # ===========================================
 st.set_page_config(
-    page_title="NSE Watchlist + Strategy + Scanner + Option Chain",
+    page_title="NSE Trading Dashboard",
     layout="wide"
 )
 
-# Simple dark-style override (works even if Streamlit theme is default)
 st.markdown(
     """
     <style>
@@ -23,15 +22,12 @@ st.markdown(
         background-color: #0e1117;
         color: #fafafa;
     }
-    .stDataFrame, .stMetric, .stMarkdown, .stSelectbox, .stButton, .stSlider {
-        color: #fafafa;
-    }
     </style>
     """,
     unsafe_allow_html=True
 )
 
-st.title("📊 NSE Live Watchlist + Strategy + Scanner + Option Chain (NSE Data Only)")
+st.title("📊 NSE Trading Dashboard – Watchlist, Scanner, Options, Backtest, Calculator & Screeners")
 
 # ===========================================
 # SIDEBAR – REFRESH + TELEGRAM
@@ -57,7 +53,6 @@ def send_telegram(msg: str):
             timeout=5
         )
     except Exception:
-        # Do not crash UI if Telegram fails
         pass
 
 
@@ -157,8 +152,8 @@ def get_history_from_nse(symbol: str, days_back: int = 180) -> pd.DataFrame | No
 
         # EMAs
         df["EMA9"] = df["Close"].ewm(span=9, adjust=False).mean()
-        df["EMA21"] = df["Close"].ewm(span=21, adjust=False).mean()
         df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
+        df["EMA21"] = df["Close"].ewm(span=21, adjust=False).mean()
         df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
 
         # Indicators
@@ -193,9 +188,6 @@ def get_history_from_nse(symbol: str, days_back: int = 180) -> pd.DataFrame | No
 def compute_strategy_signal(last_row: pd.Series,
                             vol_spike: bool,
                             breakout: bool) -> str:
-    """
-    Multi-condition strategy (daily).
-    """
     ema20 = last_row.get("EMA20", np.nan)
     ema50 = last_row.get("EMA50", np.nan)
     rsi_val = last_row.get("RSI", np.nan)
@@ -205,19 +197,16 @@ def compute_strategy_signal(last_row: pd.Series,
 
     up_trend = st_dir_val == 1
     ema_bull = not np.isnan(ema20) and not np.isnan(ema50) and ema20 > ema50
-    macd_bull = not np.isnan(macd_val) and not np.isnan(macd_sig) and macd_val > macd_sig
+    macd_bull = not (np.isnan(macd_val) or np.isnan(macd_sig)) and macd_val > macd_sig
     rsi_bull = not np.isnan(rsi_val) and rsi_val > 55
 
-    # Strong buy: all alignment + breakout + volume spike
     if up_trend and ema_bull and macd_bull and rsi_bull and breakout and vol_spike:
         return "STRONG BUY ✅"
 
-    # Buy: trend + at least two confirmations
     bullish_count = sum([up_trend, ema_bull, macd_bull, rsi_bull])
     if bullish_count >= 3 and (breakout or vol_spike):
         return "BUY ✅"
 
-    # Sell: clear downtrend / bearish momentum
     if st_dir_val == -1 or (not np.isnan(rsi_val) and rsi_val < 45 and not macd_bull):
         return "SELL ❌"
 
@@ -225,18 +214,11 @@ def compute_strategy_signal(last_row: pd.Series,
 
 
 # ===========================================
-# MULTI-TF STRATEGY ENGINE (DAILY-ONLY SKELETON)
+# MULTI-TF ENGINE (DAILY SKELETON)
 # ===========================================
-def compute_multitf_signal(
-    daily_row: pd.Series,
-    tf15_row: pd.Series | None = None,
-    tf5_row: pd.Series | None = None
-) -> str:
-    """
-    Multi-timeframe decision engine.
-    Currently uses DAILY row only.
-    Later you can plug 15m / 5m rows from broker intraday data (Angel websocket).
-    """
+def compute_multitf_signal(daily_row: pd.Series,
+                           tf15_row: pd.Series | None = None,
+                           tf5_row: pd.Series | None = None) -> str:
     ema20 = daily_row.get("EMA20", np.nan)
     ema50 = daily_row.get("EMA50", np.nan)
     rsi_val = daily_row.get("RSI", np.nan)
@@ -260,12 +242,9 @@ def compute_multitf_signal(
 
 
 # ===========================================
-# SIMPLE BACKTEST ENGINE (DAILY)
+# BACKTEST ENGINE (DAILY)
 # ===========================================
 def run_backtest(symbol: str, days_back: int = 400):
-    """
-    Simple long-only backtest using daily candles and compute_strategy_signal.
-    """
     df = get_history_from_nse(symbol, days_back=days_back)
     if df is None or df.empty:
         return None, None
@@ -280,14 +259,13 @@ def run_backtest(symbol: str, days_back: int = 400):
     entry_price = 0.0
     trades = []
 
-    for i in range(25, len(df)):  # need indicators to be ready
+    for i in range(25, len(df)):
         row = df.iloc[i]
         breakout = row["Close"] > row["HIGH20"] if not np.isnan(row["HIGH20"]) else False
-        vol_spike = False  # can reuse volume logic if required
+        vol_spike = False
 
         signal = compute_strategy_signal(row, vol_spike, breakout)
 
-        # Entry: Buy when STRONG BUY or BUY and no position
         if position == 0 and ("BUY" in signal):
             qty = int(cash // row["Close"])
             if qty > 0:
@@ -301,7 +279,6 @@ def run_backtest(symbol: str, days_back: int = 400):
                     "Qty": qty
                 })
 
-        # Exit conditions
         exit_condition = (
             (position > 0 and "SELL" in signal) or
             (position > 0 and row["Close"] < entry_price * 0.97) or
@@ -363,16 +340,14 @@ def is_inside_bar(df: pd.DataFrame, idx: int) -> bool:
     return cur["High"] < prev["High"] and cur["Low"] > prev["Low"]
 
 
-# ========= SUPPORT / RESISTANCE + ZONES + TRENDLINES HELPERS =========
+# ========= PIVOTS, ZONES, TRENDLINES =========
 def get_pivots(df: pd.DataFrame, left: int = 3, right: int = 3):
-    """Return indices of pivot highs and lows using swing structure."""
     pivot_highs = []
     pivot_lows = []
     for i in range(left, len(df) - right):
         window = df.iloc[i-left:i+right+1]
         high = df["High"].iloc[i]
         low = df["Low"].iloc[i]
-
         if high == window["High"].max():
             pivot_highs.append(i)
         if low == window["Low"].min():
@@ -381,24 +356,18 @@ def get_pivots(df: pd.DataFrame, left: int = 3, right: int = 3):
 
 
 def build_zones_from_pivots(df: pd.DataFrame, pivot_idx_list, kind: str = "demand", max_zones: int = 3):
-    """
-    Build simple supply/demand zones from pivot indices.
-    kind = 'demand' (from swing lows) or 'supply' (from swing highs)
-    Returns list of (x0, x1, y0, y1)
-    """
     zones = []
     for idx in reversed(pivot_idx_list):
         bar = df.iloc[idx]
         if kind == "demand":
             price_low = bar["Low"]
-            price_high = bar["Low"] * 1.005  # 0.5% band
-        else:  # supply
+            price_high = bar["Low"] * 1.005
+        else:
             price_high = bar["High"]
-            price_low = bar["High"] * 0.995  # 0.5% band
+            price_low = bar["High"] * 0.995
 
         x0 = bar["Date"]
-        x1 = df["Date"].iloc[-1]  # extend zone to latest candle
-
+        x1 = df["Date"].iloc[-1]
         zones.append((x0, x1, price_low, price_high))
         if len(zones) >= max_zones:
             break
@@ -406,10 +375,6 @@ def build_zones_from_pivots(df: pd.DataFrame, pivot_idx_list, kind: str = "deman
 
 
 def build_trendline_points(df: pd.DataFrame, pivot_idx_list, use="low"):
-    """
-    From a list of pivot indices, return two points for a trendline.
-    use='low' -> connect lows, use='high' -> connect highs.
-    """
     if len(pivot_idx_list) < 2:
         return None
     i1, i2 = pivot_idx_list[-2], pivot_idx_list[-1]
@@ -421,15 +386,41 @@ def build_trendline_points(df: pd.DataFrame, pivot_idx_list, use="low"):
     return x_vals, y_vals
 
 
+# ========= INDEX MEMBERS LOADER =========
+def load_index_members(index_name: str):
+    # index_name like "NIFTY 50", "NIFTY 100", "NIFTY 500"
+    encoded = index_name.replace(" ", "%20")
+    payload = nsefetch(f"https://www.nseindia.com/api/equity-stockIndices?index={encoded}")
+    return sorted([row["symbol"] for row in payload["data"]])
+
+
 # ===========================================
 # TABS
 # ===========================================
-tab_watch, tab_chart, tab_opt, tab_scan, tab_bt, tab_calc = st.tabs(
-    ["📈 Watchlist", "📊 Chart", "📉 Option Chain", "🚨 NIFTY500 Scanner", "📜 Backtest", "🧮 Calculator"]
-)
+(
+    tab_watch,
+    tab_chart,
+    tab_opt,
+    tab_scan,
+    tab_bt,
+    tab_calc,
+    tab_scr50,
+    tab_scr100,
+    tab_scr500,
+) = st.tabs([
+    "📈 Watchlist",
+    "📊 Chart",
+    "📉 Option Chain",
+    "🚨 NIFTY500 Scanner",
+    "📜 Backtest",
+    "🧮 Calculator",
+    "📌 NIFTY50 Screener",
+    "📌 NIFTY100 Screener",
+    "📌 NIFTY500 Screener",
+])
 
 # ===========================================
-# TAB 1 – WATCHLIST WITH STRATEGY SIGNALS
+# TAB 1 – WATCHLIST
 # ===========================================
 with tab_watch:
     st.subheader("📈 Live Watchlist + Strategy Signals (Daily)")
@@ -556,7 +547,7 @@ with tab_watch:
 
 
 # ===========================================
-# TAB 2 – CHART (CANDLESTICKS + INDICATORS + ZONES + PATTERNS)
+# TAB 2 – CHART
 # ===========================================
 with tab_chart:
     st.subheader("📊 Candlestick Chart with EMA, Supertrend, Patterns & Zones (Daily)")
@@ -585,7 +576,6 @@ with tab_chart:
             name="Price"
         ))
 
-        # EMA lines
         fig_candle.add_trace(go.Scatter(
             x=dfc["Date"], y=dfc["EMA9"], mode="lines", name="EMA9",
             line=dict(color="green")
@@ -606,7 +596,6 @@ with tab_chart:
             x=dfc["Date"], y=dfc["SUPERTREND"], mode="lines", name="Supertrend"
         ))
 
-        # EMA9/21 crossover arrows
         bullish_points = dfc[dfc["CROSS"] == "Bullish"]
         bearish_points = dfc[dfc["CROSS"] == "Bearish"]
 
@@ -630,7 +619,6 @@ with tab_chart:
             name="Bearish Cross"
         ))
 
-        # ==== PATTERN MARKERS ON CHART ====
         dfc["BullishEngulfing"] = [
             is_bullish_engulfing(dfc, i) for i in range(len(dfc))
         ]
@@ -642,7 +630,7 @@ with tab_chart:
         ]
         dfc["Breakout20"] = dfc["Close"] > dfc["HIGH20"].shift()
 
-        be = dfc[dfc["BullishEngulfing"] == True]
+        be = dfc[dfc["BullishEngulfing"]]
         fig_candle.add_trace(go.Scatter(
             x=be["Date"], y=be["Low"] * 0.995,
             mode="text",
@@ -651,7 +639,7 @@ with tab_chart:
             name="Bullish Engulfing"
         ))
 
-        ha = dfc[dfc["HammerPattern"] == True]
+        ha = dfc[dfc["HammerPattern"]]
         fig_candle.add_trace(go.Scatter(
             x=ha["Date"], y=ha["Low"] * 0.995,
             mode="text",
@@ -660,7 +648,7 @@ with tab_chart:
             name="Hammer"
         ))
 
-        ib = dfc[dfc["InsideBar"] == True]
+        ib = dfc[dfc["InsideBar"]]
         fig_candle.add_trace(go.Scatter(
             x=ib["Date"], y=ib["High"] * 1.005,
             mode="text",
@@ -669,7 +657,7 @@ with tab_chart:
             name="Inside Bar"
         ))
 
-        bo = dfc[dfc["Breakout20"] == True]
+        bo = dfc[dfc["Breakout20"]]
         fig_candle.add_trace(go.Scatter(
             x=bo["Date"], y=bo["High"] * 1.01,
             mode="text",
@@ -678,7 +666,6 @@ with tab_chart:
             name="Breakout 20D High"
         ))
 
-        # ========= AUTO ZONES & TRENDLINES =========
         ph_idx, pl_idx = get_pivots(dfc, left=3, right=3)
 
         demand_zones = build_zones_from_pivots(dfc, pl_idx, kind="demand", max_zones=3)
@@ -750,380 +737,10 @@ with tab_chart:
             st.markdown("**MACD**")
             fig_macd = go.Figure()
             fig_macd.add_trace(
-                go.Scatter(x=dfc["Date"], y=dfc["MACD"], mode="lines", name="MACD")
+                go.Scatter(x=dcf["Date"], y=dfc["MACD"], mode="lines", name="MACD")
             )
             fig_macd.add_trace(
                 go.Scatter(x=dfc["Date"], y=dfc["MACD_SIGNAL"], mode="lines", name="Signal")
             )
             fig_macd.update_layout(height=250)
             st.plotly_chart(fig_macd, use_container_width=True)
-
-
-# ===========================================
-# TAB 3 – OPTION CHAIN + OI CHANGE HEATMAP
-# ===========================================
-with tab_opt:
-    st.subheader("📉 Option Chain – OI, PCR, Support & Resistance + OI Change Heatmap")
-
-    oc_symbol = st.selectbox(
-        "Select F&O symbol",
-        ["NIFTY", "BANKNIFTY"] + all_symbols
-    )
-
-    if "prev_oc" not in st.session_state:
-        st.session_state["prev_oc"] = None
-
-    try:
-        if oc_symbol in ["NIFTY", "BANKNIFTY"]:
-            url = f"https://www.nseindia.com/api/option-chain-indices?symbol={oc_symbol}"
-        else:
-            url = f"https://www.nseindia.com/api/option-chain-equities?symbol={oc_symbol}"
-
-        payload = nsefetch(url)
-        data = payload["records"]["data"]
-
-        oc_rows = []
-        for r in data:
-            strike = r.get("strikePrice")
-            ce_oi = r.get("CE", {}).get("openInterest", 0)
-            pe_oi = r.get("PE", {}).get("openInterest", 0)
-            oc_rows.append([strike, ce_oi, pe_oi])
-
-        oc = pd.DataFrame(oc_rows, columns=["Strike", "CE_OI", "PE_OI"]).dropna()
-        if oc.empty:
-            st.warning("No option chain data available.")
-        else:
-            prev_oc = st.session_state.get("prev_oc")
-
-            if prev_oc is not None:
-                oc = oc.merge(prev_oc[["Strike", "CE_OI", "PE_OI"]],
-                              on="Strike", how="left", suffixes=("", "_prev"))
-                oc["CE_OI_prev"].fillna(oc["CE_OI"], inplace=True)
-                oc["PE_OI_prev"].fillna(oc["PE_OI"], inplace=True)
-                oc["CE_OI_CHG"] = oc["CE_OI"] - oc["CE_OI_prev"]
-                oc["PE_OI_CHG"] = oc["PE_OI"] - oc["PE_OI_prev"]
-            else:
-                oc["CE_OI_CHG"] = 0
-                oc["PE_OI_CHG"] = 0
-
-            st.session_state["prev_oc"] = oc.copy()
-
-            total_ce = oc["CE_OI"].sum()
-            total_pe = oc["PE_OI"].sum()
-            pcr = total_pe / total_ce if total_ce else None
-
-            res_strike = oc.loc[oc["CE_OI"].idxmax(), "Strike"]
-            sup_strike = oc.loc[oc["PE_OI"].idxmax(), "Strike"]
-
-            c1, c2, c3 = st.columns(3)
-            c1.metric("PCR", f"{pcr:.2f}" if pcr else "NA")
-            c2.metric("Resistance (Max CE OI)", res_strike)
-            c3.metric("Support (Max PE OI)", sup_strike)
-
-            st.markdown("### 🔍 OI by Strike")
-            fig_oi = go.Figure()
-            fig_oi.add_trace(go.Bar(x=oc["Strike"], y=oc["CE_OI"], name="Call OI"))
-            fig_oi.add_trace(go.Bar(x=oc["Strike"], y=oc["PE_OI"], name="Put OI"))
-            fig_oi.update_layout(
-                barmode="group",
-                height=400,
-                xaxis_title="Strike",
-                yaxis_title="Open Interest"
-            )
-            st.plotly_chart(fig_oi, use_container_width=True)
-
-            st.markdown("### 🌡 OI Change Heatmap (vs Previous Refresh)")
-            heat_df = pd.DataFrame({
-                "Strike": oc["Strike"].astype(str).tolist() * 2,
-                "Type": ["CE"] * len(oc) + ["PE"] * len(oc),
-                "OI_Change": list(oc["CE_OI_CHG"]) + list(oc["PE_OI_CHG"])
-            })
-
-            pivot = heat_df.pivot(index="Type", columns="Strike", values="OI_Change")
-
-            fig_hm = go.Figure(data=go.Heatmap(
-                z=pivot.values,
-                x=pivot.columns,
-                y=pivot.index,
-                colorbar_title="Δ OI"
-            ))
-            fig_hm.update_layout(height=300, xaxis_title="Strike", yaxis_title="Type")
-            st.plotly_chart(fig_hm, use_container_width=True)
-
-            st.markdown("### ⚡ Top OI Change Strikes")
-            top_changes = oc.assign(
-                Total_OI_Change=oc["CE_OI_CHG"].abs() + oc["PE_OI_CHG"].abs()
-            ).sort_values("Total_OI_Change", ascending=False).head(10)
-            st.dataframe(
-                top_changes[["Strike", "CE_OI_CHG", "PE_OI_CHG", "CE_OI", "PE_OI"]],
-                use_container_width=True
-            )
-
-    except Exception as e:
-        st.error(f"Error fetching option chain: {e}")
-        st.info("Sometimes NSE blocks frequent calls; try again after a few seconds.")
-
-
-# ===========================================
-# TAB 4 – NIFTY500 SCANNER WITH PATTERNS & CROSS
-# ===========================================
-with tab_scan:
-    st.subheader("🚨 NIFTY500 Volume Spike + Breakout + Pattern Scanner")
-
-    max_scan = st.slider("Max symbols to scan", 20, 200, 60)
-    run_scan = st.button("▶ Run Scan")
-
-    if run_scan:
-        try:
-            n500_payload = nsefetch(
-                "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20500"
-            )
-            symbols500 = sorted([row["symbol"] for row in n500_payload["data"]])
-        except Exception as e:
-            st.error(f"Error loading NIFTY500 list: {e}")
-            symbols500 = []
-
-        scan_rows = []
-        alerts_scan = []
-
-        with st.spinner("Scanning NIFTY500..."):
-            for sym in symbols500[:max_scan]:
-                hist = get_history_from_nse(sym, days_back=200)
-                if hist is None or len(hist) < 25:
-                    continue
-
-                dfh = hist.reset_index(drop=True)
-                last_idx = len(dfh) - 1
-                last = dfh.iloc[last_idx]
-
-                close = float(last["Close"])
-                volume = float(last["Volume"])
-                vol20 = float(last["VOL20"]) if not np.isnan(last["VOL20"]) else None
-                high20 = float(last["HIGH20"]) if not np.isnan(last["HIGH20"]) else None
-
-                vol_spike = vol20 is not None and volume > 1.5 * vol20
-                breakout = high20 is not None and close > high20
-                be = is_bullish_engulfing(dfh, last_idx)
-                hammer = is_hammer(dfh, last_idx)
-                inside = is_inside_bar(dfh, last_idx)
-                cross_text = dfh.iloc[last_idx]["CROSS"]
-
-                if vol_spike or breakout or be or hammer or inside or cross_text != "":
-                    scan_rows.append([
-                        sym,
-                        close,
-                        int(volume),
-                        int(vol20) if vol20 is not None else None,
-                        vol_spike,
-                        breakout,
-                        be,
-                        hammer,
-                        inside,
-                        cross_text
-                    ])
-                    alerts_scan.append(
-                        f"{sym} | Close={close} | VolSpike={vol_spike} | Breakout={breakout} "
-                        f"| BullEng={be} | Hammer={hammer} | Inside={inside} | Cross={cross_text}"
-                    )
-
-        df_scan = pd.DataFrame(
-            scan_rows,
-            columns=[
-                "Symbol", "Close", "Volume", "20D Vol",
-                "Vol Spike", "Breakout",
-                "Bullish Engulfing", "Hammer", "Inside Bar",
-                "EMA9/21 Cross"
-            ]
-        )
-        if df_scan.empty:
-            st.warning("No stocks matched conditions in scanned universe.")
-        else:
-            st.dataframe(df_scan, use_container_width=True)
-            if alerts_scan:
-                send_telegram("🚨 NIFTY500 Scan Alerts:\n" + "\n".join(alerts_scan[:20]))
-
-
-# ===========================================
-# TAB 5 – BACKTEST (DAILY)
-# ===========================================
-with tab_bt:
-    st.subheader("📜 Backtest (Daily Strategy)")
-
-    bt_symbol = st.selectbox(
-        "Symbol to backtest",
-        all_symbols,
-        index=all_symbols.index("RELIANCE") if "RELIANCE" in all_symbols else 0
-    )
-
-    days_back = st.slider("Days of history", 100, 800, 400)
-
-    if st.button("▶ Run Backtest"):
-        equity, trades_df = run_backtest(bt_symbol, days_back=days_back)
-        if equity is None:
-            st.warning("Not enough data to backtest.")
-        else:
-            st.metric("Final Equity (Starting 1,00,000)", f"{equity:,.0f} ₹")
-            if trades_df is not None and not trades_df.empty:
-                st.markdown("### 🧾 Trades")
-                st.dataframe(trades_df, use_container_width=True)
-
-                pnl_series = trades_df[trades_df["Type"] == "SELL"]["PnL"].cumsum()
-                fig_bt = go.Figure(data=[go.Scatter(
-                    x=pnl_series.index, y=pnl_series.values, mode="lines", name="Cumulative PnL"
-                )])
-                fig_bt.update_layout(height=300, xaxis_title="Trade #", yaxis_title="PnL")
-                st.plotly_chart(fig_bt, use_container_width=True)
-            else:
-                st.info("No completed trades generated for this period/strategy.")
-
-
-# ===========================================
-# TAB 6 – INVESTMENT CALCULATOR (COMPARE + SIP + CHART)
-# ===========================================
-with tab_calc:
-    st.subheader("🧮 Investment Return Calculator – Lumpsum & SIP")
-
-    calc_symbols = st.multiselect(
-        "Select Stocks (for comparison)",
-        all_symbols,
-        default=["RELIANCE", "TCS", "HDFCBANK"]
-    )
-
-    col_lump, col_sip = st.columns(2)
-
-    # ---------- Lumpsum ----------
-    with col_lump:
-        st.markdown("### 💰 Lumpsum Calculator")
-        invest_amt = st.number_input("Investment Amount (₹ per stock)", min_value=1000, max_value=50000000, value=100000)
-        years = st.slider("Years ago (Lumpsum)", 1, 15, 5, key="years_lump")
-
-        if st.button("Calculate Lumpsum Returns"):
-            results = []
-            growth_data = {}
-
-            for sym in calc_symbols:
-                df_hist = get_history_from_nse(sym, days_back=years * 365)
-                if df_hist is None or df_hist.empty or len(df_hist) < 10:
-                    continue
-
-                start_price = df_hist.iloc[0]["Close"]
-                current_price = df_hist.iloc[-1]["Close"]
-
-                qty = invest_amt / start_price
-                today_value = qty * current_price
-                returns_pct = (today_value / invest_amt - 1) * 100
-                total_years = (df_hist.iloc[-1]["Date"] - df_hist.iloc[0]["Date"]).days / 365
-                if total_years <= 0:
-                    total_years = years
-                cagr = ((today_value / invest_amt) ** (1 / total_years) - 1) * 100
-
-                results.append([
-                    sym, f"{start_price:.2f}", f"{current_price:.2f}",
-                    f"{qty:.2f}", f"{today_value:,.0f}", f"{returns_pct:.2f}%", f"{cagr:.2f}%"
-                ])
-
-                growth_curve = df_hist["Close"] / start_price * invest_amt
-                growth_data[sym] = (df_hist["Date"], growth_curve.tolist())
-
-            if not results:
-                st.error("No valid historical data found to compute.")
-            else:
-                st.markdown("#### 🥇 Lumpsum Leaderboard")
-                df_res = pd.DataFrame(results, columns=[
-                    "Stock", "Start Price", "Current Price", "Qty", "Value Today", "Total Return %", "CAGR %"
-                ]).sort_values("Value Today", ascending=False)
-
-                st.dataframe(df_res, use_container_width=True)
-
-                st.markdown("#### 📈 Lumpsum Value Growth Curve")
-                fig_gc = go.Figure()
-                for sym, (dates, curve) in growth_data.items():
-                    fig_gc.add_trace(go.Scatter(
-                        x=dates,
-                        y=curve,
-                        mode="lines",
-                        name=sym
-                    ))
-                fig_gc.update_layout(
-                    height=400,
-                    xaxis_title="Date",
-                    yaxis_title="Value (₹)"
-                )
-                st.plotly_chart(fig_gc, use_container_width=True)
-
-    # ---------- SIP ----------
-    with col_sip:
-        st.markdown("### 📆 SIP Calculator (Monthly)")
-        sip_symbol = st.selectbox(
-            "SIP Stock",
-            all_symbols,
-            index=all_symbols.index("RELIANCE") if "RELIANCE" in all_symbols else 0,
-            key="sip_symbol"
-        )
-        sip_amt = st.number_input("Monthly SIP Amount (₹)", min_value=500, max_value=1000000, value=5000)
-        sip_years = st.slider("SIP Duration (years)", 1, 15, 5, key="sip_years")
-
-        if st.button("Calculate SIP Returns"):
-            df_sip = get_history_from_nse(sip_symbol, days_back=sip_years * 365 + 60)
-            if df_sip is None or df_sip.empty or len(df_sip) < 20:
-                st.error("Not enough historical data for SIP calculation.")
-            else:
-                df_sip["YearMonth"] = df_sip["Date"].dt.to_period("M")
-                monthly = df_sip.groupby("YearMonth").first().reset_index()
-                monthly.sort_values("Date", inplace=True)
-
-                # Use only last `sip_years` years
-                if len(monthly) > sip_years * 12:
-                    monthly = monthly.iloc[-sip_years * 12:]
-
-                units = 0.0
-                cash_flows = []
-                dates_cf = []
-                for _, row in monthly.iterrows():
-                    price = row["Close"]
-                    units += sip_amt / price
-                    cash_flows.append(-sip_amt)
-                    dates_cf.append(row["Date"])
-
-                last_price = df_sip.iloc[-1]["Close"]
-                current_value = units * last_price
-                total_invested = sip_amt * len(monthly)
-                profit = current_value - total_invested
-                total_years_sip = (df_sip.iloc[-1]["Date"] - monthly.iloc[0]["Date"]).days / 365
-
-                if total_years_sip <= 0:
-                    total_years_sip = sip_years
-                cagr_sip = ((current_value / total_invested) ** (1 / total_years_sip) - 1) * 100
-
-                st.metric("Total Invested", f"₹{total_invested:,.0f}")
-                st.metric("Current Value", f"₹{current_value:,.0f}")
-                st.metric("Profit", f"₹{profit:,.0f}")
-                st.metric("Approx. CAGR", f"{cagr_sip:.2f}%")
-
-                st.success(
-                    f"SIP of ₹{sip_amt:,.0f} / month in {sip_symbol} for ~{total_years_sip:.1f} years → "
-                    f"₹{current_value:,.0f} (Invested ₹{total_invested:,.0f})"
-                )
-
-                # SIP growth curve
-                st.markdown("#### 📈 SIP Portfolio Growth Over Time")
-                portfolio_values = []
-                cum_units = 0.0
-                for _, row in monthly.iterrows():
-                    cum_units += sip_amt / row["Close"]
-                    portfolio_values.append(cum_units * row["Close"])
-
-                fig_sip = go.Figure(
-                    data=[go.Scatter(
-                        x=monthly["Date"],
-                        y=portfolio_values,
-                        mode="lines+markers",
-                        name="SIP Value"
-                    )]
-                )
-                fig_sip.update_layout(
-                    height=350,
-                    xaxis_title="Date",
-                    yaxis_title="Portfolio Value (₹)"
-                )
-                st.plotly_chart(fig_sip, use_container_width=True)
