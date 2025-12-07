@@ -6,9 +6,11 @@ from nsepython import nsefetch
 from streamlit_autorefresh import st_autorefresh
 import requests
 from datetime import date, timedelta
+import math
+import yfinance as yf
 
 # ===========================================
-# PAGE CONFIG + DARK THEME
+# CONFIG
 # ===========================================
 st.set_page_config(page_title="NSE Trading Dashboard", layout="wide")
 
@@ -24,7 +26,11 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.title("📊 NSE Trading Dashboard – Watchlist | Chart | Options | Scanner | Backtest | Calculator")
+st.title("📊 NSE Trading Dashboard – Watchlist | Chart | Options | Scanner | Backtest | Calculator | Intelligence")
+
+# 🔑 News API key (OPTIONAL – for news & sentiment)
+# Get a free key from https://newsapi.org and paste here
+NEWS_API_KEY = "YOUR_NEWSAPI_KEY_HERE"
 
 # ===========================================
 # SIDEBAR – REFRESH + TELEGRAM (OPTIONAL)
@@ -186,7 +192,7 @@ def compute_strategy_signal(last_row: pd.Series, vol_spike: bool, breakout: bool
 
     up_trend = st_dir_val == 1
     ema_bull = not np.isnan(ema20) and not np.isnan(ema50) and ema20 > ema50
-    macd_bull = not (np.isnan(macd_val) or np.isnan(macd_sig)) and macd_val > macd_sig
+    macd_bull = not (np.isnan(macd_val) or np.isnan(macc_sig := macd_sig)) and macd_val > macc_sig
     rsi_bull = not np.isnan(rsi_val) and rsi_val > 55
 
     if up_trend and ema_bull and macd_bull and rsi_bull and breakout and vol_spike:
@@ -303,6 +309,181 @@ def is_inside_bar(df: pd.DataFrame, idx: int) -> bool:
 
 
 # ===========================================
+# NEWS & FUNDAMENTALS HELPERS (INTELLIGENCE TAB)
+# ===========================================
+POS_WORDS = ["up", "gain", "gains", "bullish", "profit", "surge", "rally", "beat", "strong", "record", "buy", "upgrade"]
+NEG_WORDS = ["down", "falls", "fall", "cut", "loss", "weak", "fraud", "probe", "downgrade", "default", "scam", "sell"]
+
+
+def get_latest_news(symbol: str, max_articles: int = 10):
+    """Fetch latest news for the stock using NewsAPI.org (or return [] if key missing)."""
+    if not NEWS_API_KEY or NEWS_API_KEY == "YOUR_NEWSAPI_KEY_HERE":
+        return []
+    try:
+        url = (
+            "https://newsapi.org/v2/everything?"
+            f"q={symbol}&language=en&sortBy=publishedAt&pageSize={max_articles}&apiKey={NEWS_API_KEY}"
+        )
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        if data.get("status") != "ok":
+            return []
+        articles = data.get("articles", [])
+        cleaned = []
+        for a in articles:
+            cleaned.append(
+                {
+                    "title": a.get("title", ""),
+                    "source": a.get("source", {}).get("name", ""),
+                    "url": a.get("url", ""),
+                    "publishedAt": a.get("publishedAt", "")[:10],
+                    "description": a.get("description", ""),
+                }
+            )
+        return cleaned
+    except Exception:
+        return []
+
+
+def simple_sentiment_score(text: str) -> int:
+    if not text:
+        return 0
+    t = text.lower()
+    score = 0
+    for w in POS_WORDS:
+        if w in t:
+            score += 1
+    for w in NEG_WORDS:
+        if w in t:
+            score -= 1
+    return score
+
+
+def aggregate_news_sentiment(articles):
+    if not articles:
+        return 50, []  # neutral if no news
+    detailed = []
+    total = 0
+    for a in articles:
+        s = simple_sentiment_score(a["title"] + " " + (a.get("description") or ""))
+        total += s
+        detailed.append({**a, "sentiment_raw": s})
+    avg_raw = total / len(articles)
+    norm = max(-3, min(3, avg_raw))
+    score_0_100 = int((norm + 3) / 6 * 100)
+    return score_0_100, detailed
+
+
+def get_fundamentals_yf(symbol: str):
+    """Basic fundamentals via yfinance (optional)."""
+    try:
+        yf_symbol = symbol + ".NS"
+        ticker = yf.Ticker(yf_symbol)
+        info = ticker.info
+        pe = info.get("trailingPE")
+        pb = info.get("priceToBook")
+        roe = info.get("returnOnEquity")
+        debt_equity = info.get("debtToEquity")
+        mcap = info.get("marketCap")
+
+        return {
+            "PE": pe,
+            "PB": pb,
+            "ROE": roe,
+            "DebtToEquity": debt_equity,
+            "MarketCap": mcap,
+        }
+    except Exception:
+        return {}
+
+
+def fundamentals_score(f):
+    if not f:
+        return 50, "No fundamentals data"
+    score = 50
+    notes = []
+
+    pe = f.get("PE")
+    if pe and pe > 0:
+        if pe < 15:
+            score += 10; notes.append("PE reasonable/cheap")
+        elif pe > 40:
+            score -= 10; notes.append("PE expensive")
+
+    pb = f.get("PB")
+    if pb and pb > 0:
+        if pb < 3:
+            score += 5; notes.append("PB OK")
+        elif pb > 6:
+            score -= 5; notes.append("PB rich")
+
+    roe = f.get("ROE")
+    if roe:
+        roe_pct = roe * 100 if roe < 1 else roe
+        if roe_pct > 15:
+            score += 10; notes.append(f"ROE strong ({roe_pct:.1f}%)")
+        elif roe_pct < 8:
+            score -= 5; notes.append(f"ROE weak ({roe_pct:.1f}%)")
+
+    de = f.get("DebtToEquity")
+    if de is not None:
+        if de < 0.5:
+            score += 10; notes.append("Low leverage")
+        elif de > 2:
+            score -= 10; notes.append("High leverage")
+
+    score = max(0, min(100, score))
+    verdict = (
+        "Strong fundamentals" if score >= 70
+        else "Average fundamentals" if score >= 40
+        else "Weak fundamentals"
+    )
+    return score, verdict + " | " + "; ".join(notes)
+
+
+def technical_score(symbol: str):
+    df = get_history_from_nse(symbol, days_back=200)
+    if df is None or df.empty:
+        return 50, "No data"
+
+    last = df.iloc[-1]
+    score = 50
+    notes = []
+
+    if last["EMA9"] > last["EMA21"] > last["EMA50"]:
+        score += 15; notes.append("Uptrend (EMA9>21>50)")
+    elif last["EMA50"] > last["EMA21"] > last["EMA9"]:
+        score -= 15; notes.append("Downtrend (EMA9<21<50)")
+
+    rsi_val = last["RSI"]
+    if rsi_val > 60:
+        score += 10; notes.append(f"RSI strong ({rsi_val:.1f})")
+    elif rsi_val < 40:
+        score -= 10; notes.append(f"RSI weak ({rsi_val:.1f})")
+
+    if last["MACD"] > last["MACD_SIGNAL"]:
+        score += 5; notes.append("MACD bullish")
+    else:
+        score -= 5; notes.append("MACD bearish")
+
+    if not math.isnan(last["VOL20"]) and last["Volume"] > 1.5 * last["VOL20"]:
+        score += 5; notes.append("Volume spike")
+
+    if not math.isnan(last["HIGH20"]) and last["Close"] > last["HIGH20"]:
+        score += 10; notes.append("20D breakout")
+    elif not math.isnan(last["HIGH20"]) and last["Close"] < 0.95 * last["HIGH20"]:
+        score -= 5; notes.append("Below recent highs")
+
+    score = max(0, min(100, score))
+    verdict = (
+        "Strong bullish" if score >= 70
+        else "Neutral / range" if 40 <= score < 70
+        else "Weak / bearish"
+    )
+    return score, verdict + " | " + "; ".join(notes)
+
+
+# ===========================================
 # TABS
 # ===========================================
 (
@@ -312,6 +493,7 @@ def is_inside_bar(df: pd.DataFrame, idx: int) -> bool:
     tab_scan,
     tab_bt,
     tab_calc,
+    tab_intel,
 ) = st.tabs(
     [
         "📈 Watchlist",
@@ -320,6 +502,7 @@ def is_inside_bar(df: pd.DataFrame, idx: int) -> bool:
         "🚨 NIFTY500 Scanner",
         "📜 Backtest",
         "🧮 Calculator",
+        "🧠 Stock Intelligence",
     ]
 )
 
@@ -636,10 +819,10 @@ with tab_chart:
 
 
 # ===========================================
-# TAB 3 – ADVANCED OPTION CHAIN (C)
+# TAB 3 – ADVANCED OPTION CHAIN
 # ===========================================
 with tab_opt:
-    st.subheader("📉 Option Chain – OI, PCR, Max Pain, Basic Greeks")
+    st.subheader("📉 Option Chain – OI, PCR, Max Pain, OI Change Heatmap")
 
     oc_symbol = st.selectbox(
         "Select F&O symbol",
@@ -960,3 +1143,64 @@ with tab_calc:
                     f"SIP of ₹{sip_amt:,.0f}/month in {sip_symbol} for ~{total_years:.1f} years "
                     f"→ ₹{current_value:,.0f} (Invested ₹{total_invested:,.0f})"
                 )
+
+
+# ===========================================
+# TAB 7 – STOCK INTELLIGENCE (TECH + NEWS + FUNDAMENTALS)
+# ===========================================
+with tab_intel:
+    st.subheader("🧠 Stock Intelligence – 360° View")
+
+    intel_symbol = st.selectbox(
+        "Select stock for intelligence analysis",
+        all_symbols,
+        index=all_symbols.index("RELIANCE") if "RELIANCE" in all_symbols else 0,
+    )
+
+    col_top1, col_top2, col_top3 = st.columns(3)
+
+    with st.spinner("Computing technicals..."):
+        tech_score, tech_summary = technical_score(intel_symbol)
+
+    with col_top1:
+        st.metric("Technical Score", f"{tech_score}/100")
+        st.caption(tech_summary)
+
+    with st.spinner("Fetching fundamentals..."):
+        f = get_fundamentals_yf(intel_symbol)
+        fund_score, fund_summary = fundamentals_score(f)
+
+    with col_top2:
+        st.metric("Fundamental Score", f"{fund_score}/100")
+        st.caption(fund_summary)
+
+    with st.spinner("Fetching latest news & sentiment..."):
+        articles = get_latest_news(intel_symbol, max_articles=10)
+        news_score, detailed_news = aggregate_news_sentiment(articles)
+
+    with col_top3:
+        st.metric("News Sentiment", f"{news_score}/100")
+        if not detailed_news:
+            st.caption("No recent news found or API key not set.")
+        else:
+            st.caption("Based on latest headlines.")
+
+    combined = int(0.5 * tech_score + 0.3 * news_score + 0.2 * fund_score)
+    if combined >= 70:
+        label = "✅ Strong Bullish Bias"
+    elif combined >= 40:
+        label = "😐 Neutral / Mixed"
+    else:
+        label = "⚠️ Weak / Risky"
+
+    st.markdown("---")
+    st.markdown(f"### 🧾 Final Intelligence Score: **{combined}/100** – {label}")
+
+    if f:
+        st.markdown("#### 📊 Fundamental Snapshot")
+        st.json(f)
+
+    if detailed_news:
+        st.markdown("#### 📰 Latest News & Sentiment")
+        news_df = pd.DataFrame(detailed_news)[["publishedAt", "source", "title", "sentiment_raw", "url"]]
+        st.dataframe(news_df, use_container_width=True)
