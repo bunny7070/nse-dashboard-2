@@ -4,21 +4,30 @@ import numpy as np
 import requests
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="Option Chain Pro Terminal",
-                   layout="wide",
-                   page_icon="🧠")
+st.set_page_config(
+    page_title="Option Chain Pro Terminal",
+    layout="wide",
+    page_icon="🧠"
+)
 
-st.title("🧠 Option Chain Pro Terminal – Advanced v2.0")
-st.write("NIFTY • BANKNIFTY • F&O Stocks • Greeks • Max Pain • Signal Engine")
+st.title("🧠 Option Chain Pro Terminal – Advanced")
+st.write("NIFTY • BANKNIFTY • F&O Stocks • PCR • Max Pain • Support & Resistance • Signals")
 
 symbol = st.selectbox("Select Symbol", ["NIFTY", "BANKNIFTY", "RELIANCE", "TCS", "INFY"])
 refresh = st.slider("Auto Refresh (Seconds)", 10, 300, 30)
 
-@st.cache_data(ttl=refresh)
-def fetch_oc(symbol):
+
+@st.cache_data(ttl=60)
+def fetch_oc(symbol: str):
+    """
+    Safely fetch option chain from NSE.
+    Returns: (records_list, expiry_list, error_message)
+    """
     headers = {
-        "user-agent": "Mozilla/5.0",
-        "accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json, text/plain, */*",
+        "Connection": "keep-alive",
+        "Referer": "https://www.nseindia.com/",
     }
 
     if symbol in ["NIFTY", "BANKNIFTY"]:
@@ -26,96 +35,186 @@ def fetch_oc(symbol):
     else:
         url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
 
-    s = requests.Session()
-    s.get("https://www.nseindia.com", headers=headers)
-    r = s.get(url, headers=headers).json()
+    try:
+        session = requests.Session()
+        # Hit homepage once to get cookies
+        session.get("https://www.nseindia.com", headers=headers, timeout=5)
 
-    exp_list = list(set([i["expiryDate"] for i in r["records"]["data"] if "CE" in i or "PE" in i]))
-    exp_list.sort()
-    return r, exp_list
+        resp = session.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return [], [], f"NSE returned HTTP {resp.status_code}. Try again later or run locally."
 
-data, expiries = fetch_oc(symbol)
+        try:
+            data = resp.json()
+        except ValueError:
+            return [], [], "NSE did not return JSON (maybe blocked / HTML page)."
+
+        records = data.get("records", {}).get("data", [])
+        if not isinstance(records, list) or len(records) == 0:
+            return [], [], "No option chain records found in NSE response."
+
+        exp_set = set()
+        for item in records:
+            exp = item.get("expiryDate")
+            if exp:
+                exp_set.add(exp)
+        expiry_list = sorted(exp_set)
+
+        if not expiry_list:
+            return [], [], "No expiry dates found in response."
+
+        return records, expiry_list, ""
+
+    except Exception as e:
+        return [], [], f"Error while fetching data: {e}"
+
+
+# --------- FETCH DATA ----------
+records, expiries, error_msg = fetch_oc(symbol)
+
+if error_msg:
+    st.error(error_msg)
+    st.stop()
+
+if not records or not expiries:
+    st.error("No data available. Please try again later.")
+    st.stop()
+
 expiry = st.selectbox("Select Expiry", expiries)
 
-# filter by expiry
-records = []
-for entry in data["records"]["data"]:
-    if entry["expiryDate"] == expiry:
-        strike = entry["strikePrice"]
-        if "CE" in entry:
-            records.append(["CE", strike,
-                            entry["CE"]["openInterest"],
-                            entry["CE"]["changeinOpenInterest"],
-                            entry["CE"]["lastPrice"],
-                            entry["CE"]["impliedVolatility"]])
-        if "PE" in entry:
-            records.append(["PE", strike,
-                            entry["PE"]["openInterest"],
-                            entry["PE"]["changeinOpenInterest"],
-                            entry["PE"]["lastPrice"],
-                            entry["PE"]["impliedVolatility"]])
+# --------- BUILD DATAFRAME ----------
+rows = []
+for entry in records:
+    if entry.get("expiryDate") != expiry:
+        continue
 
-df = pd.DataFrame(records, columns=["Type", "Strike", "OI", "ChgOI", "LTP", "IV"])
+    strike = entry.get("strikePrice")
+    ce = entry.get("CE")
+    pe = entry.get("PE")
 
-ce = df[df.Type == "CE"].sort_values("Strike")
-pe = df[df.Type == "PE"].sort_values("Strike")
+    if ce:
+        rows.append([
+            "CE",
+            strike,
+            ce.get("openInterest", 0),
+            ce.get("changeinOpenInterest", 0),
+            ce.get("lastPrice", 0.0),
+            ce.get("impliedVolatility", 0.0),
+        ])
+    if pe:
+        rows.append([
+            "PE",
+            strike,
+            pe.get("openInterest", 0),
+            pe.get("changeinOpenInterest", 0),
+            pe.get("lastPrice", 0.0),
+            pe.get("impliedVolatility", 0.0),
+        ])
+
+if not rows:
+    st.warning("No option chain rows found for this expiry.")
+    st.stop()
+
+df = pd.DataFrame(rows, columns=["Type", "Strike", "OI", "ChgOI", "LTP", "IV"])
+
+ce = df[df["Type"] == "CE"].sort_values("Strike")
+pe = df[df["Type"] == "PE"].sort_values("Strike")
+
+# make sure we can merge
+if ce.empty or pe.empty:
+    st.warning("Either CE or PE data is empty for this expiry.")
+    st.dataframe(df)
+    st.stop()
+
 merged = ce.merge(pe, on="Strike", suffixes=("_CE", "_PE"))
 
-# PCR / Max Pain / Bias
-pcr = round(merged["OI_PE"].sum() / merged["OI_CE"].sum(), 2)
-maxpain = merged.iloc[(merged["OI_PE"] - merged["OI_CE"]).abs().argsort()[:1]]["Strike"].values[0]
-bias = "📈 Bullish" if pcr > 1.1 else "📉 Bearish" if pcr < 0.9 else "🔁 Neutral"
+# --------- METRICS (with safety) ----------
+total_ce_oi = merged["OI_CE"].sum()
+total_pe_oi = merged["OI_PE"].sum()
 
-atm = merged.iloc[(merged["LTP_CE"] - merged["LTP_PE"]).abs().argsort()[:1]]["Strike"].values[0]
+if total_ce_oi == 0 or total_pe_oi == 0:
+    pcr = 0
+else:
+    pcr = round(total_pe_oi / total_ce_oi, 2)
 
-sup = merged.nlargest(5, "OI_PE")["Strike"].tolist()
-res = merged.nlargest(5, "OI_CE")["Strike"].tolist()
+try:
+    maxpain = merged.iloc[(merged["OI_PE"] - merged["OI_CE"]).abs().argsort()[:1]]["Strike"].values[0]
+except Exception:
+    maxpain = None
 
-# HEADER CARDS
+if pcr > 1.1:
+    bias = "📈 Bullish"
+elif pcr < 0.9:
+    bias = "📉 Bearish"
+else:
+    bias = "🔁 Neutral"
+
+# approximate ATM = strike closest to middle of strikes
+try:
+    atm = merged["Strike"].iloc[merged["Strike"].sub(merged["Strike"].median()).abs().idxmin()]
+except Exception:
+    atm = None
+
+# --------- HEADER CARDS ----------
 st.markdown("### 🔥 Market Summary")
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("PCR", pcr)
-c2.metric("Max Pain", maxpain)
+c2.metric("Max Pain", maxpain if maxpain is not None else "-")
 c3.metric("Trend", bias)
-c4.metric("ATM Strike", atm)
+c4.metric("Total OI (CE / PE)", f"{int(total_ce_oi):,} / {int(total_pe_oi):,}")
 
-# Support / Resistance
-st.markdown("### 🧱 Support & Resistance Levels")
+# --------- SUPPORT / RESISTANCE ----------
+st.markdown("### 🧱 Support & Resistance Zones (by OI)")
 s1, s2 = st.columns(2)
-s1.success(f"Supports (PE OI) → {sup}")
-s2.error(f"Resistances (CE OI) → {res}")
+supports = merged.nlargest(5, "OI_PE")["Strike"].tolist()
+resists = merged.nlargest(5, "OI_CE")["Strike"].tolist()
+s1.success(f"🟢 Supports (PE OI): {supports}")
+s2.error(f"🔴 Resistances (CE OI): {resists}")
 
-# OPTION CHAIN TABLE
+# --------- OPTION CHAIN TABLE ----------
 st.markdown("### 📊 Option Chain Table (Heatmap)")
-st.dataframe(merged.style.background_gradient(subset=["OI_CE"], cmap="Reds")
-                          .background_gradient(subset=["OI_PE"], cmap="Greens").highlight_max(subset=["OI_CE","OI_PE"]))
+styled = (
+    merged.style
+    .background_gradient(subset=["OI_CE"], cmap="Reds")
+    .background_gradient(subset=["OI_PE"], cmap="Greens")
+)
+st.dataframe(styled, use_container_width=True)
 
-# CHART
+# --------- OI CHART ----------
+st.markdown("### 📈 Open Interest by Strike")
 fig = go.Figure()
 fig.add_trace(go.Bar(x=merged["Strike"], y=merged["OI_CE"], name="CE OI"))
 fig.add_trace(go.Bar(x=merged["Strike"], y=merged["OI_PE"], name="PE OI"))
-fig.update_layout(title="Open Interest by Strike",
-                  barmode='group', height=400)
+fig.update_layout(
+    title="Open Interest vs Strike",
+    xaxis_title="Strike",
+    yaxis_title="Open Interest",
+    barmode="group",
+    height=450,
+)
 st.plotly_chart(fig, use_container_width=True)
 
-# Strategy Suggestions
-st.markdown("### 🧠 Strategy Engine Suggestions")
-suggestion = ""
+# --------- SIGNAL / INTERPRETATION ----------
+st.markdown("### 🧠 Signal Interpretation (Beginner Friendly)")
 
-if bias == "📈 Bullish":
-    suggestion = f"Try Bull Put Spread / PE Selling near supports: {sup[:2]}"
-elif bias == "📉 Bearish":
-    suggestion = f"Try Bear Call Spread / CE Selling near resistances: {res[:2]}"
+if bias.startswith("📈"):
+    msg = f"Market bias: **Bullish**.\n\nStrong put writing near supports {supports[:2]} suggests demand zones. Dips towards these strikes may find buying interest."
+elif bias.startswith("📉"):
+    msg = f"Market bias: **Bearish**.\n\nStrong call writing near resistances {resists[:2]} suggests supply zones. Rallies towards these strikes may face selling pressure."
 else:
-    suggestion = f"Try Short Straddle or Short Strangle around ATM {atm}"
+    msg = f"Market bias: **Sideways/Neutral**.\n\nBest to trade range between supports {supports[:2]} and resistances {resists[:2]}. Option selling strategies (strangle/straddle) may work near ATM, if risk-managed."
+st.info(msg)
 
-st.warning(suggestion)
-
-st.markdown("### 📕 Beginner Learning Guide")
-st.info("""
-**OI** → Strong level indicator  
-**Chg OI** → Where fresh positions being built  
-**PCR** > 1.1 Bullish, < 0.9 Bearish  
-**Max Pain** → Expiry magnet  
-**Support/Resistance** from high OI zones  
-""")
+st.markdown("### 📘 Beginner Guide (What These Numbers Mean)")
+st.markdown(
+"""
+| Indicator | What it is | How to read it |
+|-----------|------------|----------------|
+| **OI (Open Interest)** | Number of open contracts | High OI = strong level (support/resistance) |
+| **Chg OI** | Change in OI today | High PE Chg OI → new support building; high CE Chg OI → new resistance building |
+| **PCR (Put/Call Ratio)** | PE OI / CE OI | > 1.1 = Bullish bias, < 0.9 = Bearish bias, 0.9–1.1 = Range / neutral |
+| **Max Pain** | Strike where option sellers lose least | Price often gravitates here near expiry (not guaranteed) |
+| **Supports (PE OI)** | Strikes with highest PE OI | Price often bounces from these levels |
+| **Resistances (CE OI)** | Strikes with highest CE OI | Price often reverses or slows near these levels |
+"""
+)
